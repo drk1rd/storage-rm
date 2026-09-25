@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
-"""Render docs/demo.svg: a terminal-window picture of example `storage-rm` output."""
-from html import escape
+"""Render docs/demo.gif: an animated terminal session of example `storage-rm` output.
 
-W, LH, PAD, TOP = 920, 20, 20, 44
+Frames are drawn directly with Pillow (no screen recording needed):
+    python3 docs/make-demo.py
+"""
+from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
+
+OUT = Path(__file__).with_name("demo.gif")
+
+W, ROWS, LH, PAD, TOP = 900, 26, 20, 20, 44
+H = TOP + ROWS * LH + PAD
+BG, BAR = "#1e1e1e", "#2a2a2a"
 FG, DIM, BOLD, CYAN, GREEN, YELLOW = "#d4d4d4", "#7a7a7a", "#ffffff", "#4fc1ff", "#6ad07a", "#e5c07b"
 
-rows = [
+FONT = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13, index=0)
+FONT_B = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 13, index=1)
+CW = FONT.getlength("M")
+
+DEFAULT = [
     ("docker", "40.1G", "Docker build cache + dangling images (containers and volumes kept)"),
     ("xcode", "12.3G", "Xcode DerivedData, older iOS DeviceSupport, simulator caches"),
     ("gradle", "6.9G", "Gradle caches, daemon logs, old wrapper distributions"),
@@ -15,45 +29,88 @@ rows = [
     ("app-caches", "8.9G", "App caches: Spotify, browsers, VS Code, Cursor, Slack, …"),
     ("claude", "2.6G", "Claude desktop simulator builds"),
 ]
-optin = [
+OPTIN = [
     ("android-avd", "10.6G", "Android emulators (AVDs) and SDK system images"),
     ("node-modules", "3.1G", "node_modules in projects untouched for --days"),
 ]
 
-lines = [
-    [("$ ", DIM), ("storage-rm", BOLD)],
-    [("==>", CYAN), (" Scanning (nothing is deleted)…", FG)],
+
+def row(name, size, what):
+    return [(f"  {name:<15} {size:>8}  ", FG), (what, DIM)]
+
+
+def render(lines, cursor=False):
+    img = Image.new("RGB", (W, H), BG)
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, W, 34], fill=BAR)
+    for i, c in enumerate(["#ff5f57", "#febc2e", "#28c840"]):
+        d.ellipse([14 + i * 20, 11, 26 + i * 20, 23], fill=c)
+    d.text((W / 2, 17), "storage-rm — zsh", fill=DIM, font=FONT, anchor="mm")
+
+    visible = lines[-ROWS:]
+    for i, spans in enumerate(visible):
+        x, y = PAD, TOP + i * LH
+        for text, color in spans:
+            d.text((x, y), text, fill=color, font=FONT_B if color == BOLD else FONT)
+            x += CW * len(text)
+        if cursor and i == len(visible) - 1:
+            d.rectangle([x + 1, y, x + CW, y + 15], fill=FG)
+    return img
+
+
+frames, durations = [], []
+
+
+def shot(lines, ms, cursor=False):
+    frames.append(render(lines, cursor))
+    durations.append(ms)
+
+
+def type_cmd(lines, cmd):
+    """Type a command at a prompt, one character per frame."""
+    for n in range(len(cmd) + 1):
+        shot(lines + [[("$ ", DIM), (cmd[:n], BOLD)]], 55 if n else 500, cursor=True)
+    shot(lines + [[("$ ", DIM), (cmd, BOLD)]], 350, cursor=True)
+    return lines + [[("$ ", DIM), (cmd, BOLD)]]
+
+
+# Scene 1: scan
+screen = type_cmd([], "storage-rm")
+screen += [[("==>", CYAN), (" Scanning (nothing is deleted)…", FG)]]
+shot(screen, 600)
+screen += [[], [("  " + f"{'CATEGORY':<15} {'SIZE':>8}  WHAT", BOLD)]]
+for r in DEFAULT:
+    screen.append(row(*r))
+    shot(screen, 120)
+screen.append([("  opt-in", YELLOW)])
+for r in OPTIN:
+    screen.append(row(*r))
+    shot(screen, 120)
+screen += [
     [],
-    [("  " + f"{'CATEGORY':<15} {'SIZE':>8}  WHAT", BOLD)],
-]
-for name, size, what in rows:
-    lines.append([(f"  {name:<15} {size:>8}  ", FG), (what, DIM)])
-lines.append([("  opt-in", YELLOW)])
-for name, size, what in optin:
-    lines.append([(f"  {name:<15} {size:>8}  ", FG), (what, DIM)])
-lines += [
-    [],
-    [("  ", FG), ("clean", BOLD), (" would free about ", FG), ("77.1G", GREEN), (" — 573.2G available now", FG)],
+    [("  ", FG), ("clean", BOLD), (" would free about ", FG), ("76.6G", GREEN), (" — 573.2G available now", FG)],
     [("  opt-in categories hold another ", FG), ("13.7G", YELLOW), (" (use -o name or --all)", FG)],
 ]
+shot(screen, 3200)
 
-H = TOP + len(lines) * LH + PAD
-out = [
-    f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}">',
-    f'<rect width="{W}" height="{H}" rx="10" fill="#1e1e1e"/>',
-    '<circle cx="20" cy="18" r="6" fill="#ff5f57"/><circle cx="40" cy="18" r="6" fill="#febc2e"/>'
-    '<circle cx="60" cy="18" r="6" fill="#28c840"/>',
-    '<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" xml:space="preserve" style="white-space:pre">',
-]
-for i, spans in enumerate(lines):
-    y = TOP + i * LH + 12
-    tspans = ""
-    for t, c in spans:
-        weight = ' font-weight="bold"' if c == BOLD else ""
-        tspans += f'<tspan fill="{c}"{weight}>{escape(t)}</tspan>'
+# Scene 2: clean
+screen = type_cmd([], "storage-rm clean -y")
+screen += [[("==>", CYAN), (" Planned cleanup:", FG)]]
+screen += [row(*r) for r in DEFAULT]
+screen += [[("  total ≈ 76.6G", BOLD)], []]
+shot(screen, 1400)
+for name, _, _ in DEFAULT:
+    screen.append([("==>", CYAN), (f" {name}", FG)])
+    shot(screen, 380)
+screen += [[], [("Freed 76.6G", GREEN), (" — 649.8G available now.", FG)]]
+shot(screen, 4000)
 
-    out.append(f'<text x="{PAD}" y="{y}" xml:space="preserve">{tspans}</text>')
-out += ["</g>", "</svg>"]
-
-open("docs/demo.svg", "w").write("\n".join(out) + "\n")
-print(f"wrote docs/demo.svg ({W}x{H})")
+frames[0].save(
+    OUT,
+    save_all=True,
+    append_images=frames[1:],
+    duration=durations,
+    loop=0,
+    optimize=True,
+)
+print(f"wrote {OUT} ({W}x{H}, {len(frames)} frames, {OUT.stat().st_size // 1024} KB)")

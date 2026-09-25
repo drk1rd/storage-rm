@@ -6,7 +6,7 @@ Find and clear the stuff that quietly eats a Mac developer's disk: Docker build 
 
 Everything it removes by default gets rebuilt automatically when it's needed again. It's a single bash script that works with the stock macOS bash 3.2 and has no dependencies.
 
-![Example storage-rm scan output](docs/demo.svg)
+![storage-rm scanning and cleaning (example output)](docs/demo.gif)
 
 ## Install
 
