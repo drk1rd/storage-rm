@@ -232,7 +232,9 @@ extra_xcode() { has xcrun && run xcrun simctl delete unavailable; }
 old_gradle_dists() {
   local dir="$HOME/.gradle/wrapper/dists"
   [[ -d $dir ]] || return 0
-  ls "$dir" | grep '^gradle-' | sed -E 's/^gradle-([^-]+)-.*/\1 &/' \
+  local d
+  for d in "$dir"/gradle-*; do [[ -d $d ]] && echo "${d##*/}"; done \
+    | sed -E 's/^gradle-([^-]+)-.*/\1 &/' \
     | sort -t. -k1,1nr -k2,2nr -k3,3nr | awk '{print $2}' \
     | tail -n +$((KEEP_GRADLE + 1)) | sed "s|^|$dir/|"
 }
@@ -622,9 +624,9 @@ load_config() {
     case $key in
       ONLY)        SELECTED=$val ;;
       SKIP)        SKIP=$val ;;
-      DAYS)        [[ $val =~ ^[0-9]+$ ]] && DAYS=$val || warn "config: DAYS must be a number" ;;
+      DAYS)        if [[ $val =~ ^[0-9]+$ ]]; then DAYS=$val; else warn "config: DAYS must be a number"; fi ;;
       ROOTS)       ROOTS=$val ;;
-      KEEP_GRADLE) [[ $val =~ ^[0-9]+$ ]] && KEEP_GRADLE=$val || warn "config: KEEP_GRADLE must be a number" ;;
+      KEEP_GRADLE) if [[ $val =~ ^[0-9]+$ ]]; then KEEP_GRADLE=$val; else warn "config: KEEP_GRADLE must be a number"; fi ;;
       FORCE)       [[ $val == true ]] && FORCE=true ;;
       "")          ;;
       *)           warn "config: unknown key $key" ;;
