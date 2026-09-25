@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# storage-rm — find and clear regenerable dev/app junk on macOS.
+# Works with the stock macOS bash (3.2): no associative arrays, no mapfile.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+LIB="$HOME/Library"
+CACHES="$LIB/Caches"
+
+ALL_CATS="docker xcode gradle npm pnpm yarn brew pip cocoapods app-caches claude android-avd node-modules trash"
+DEFAULT_CATS="docker xcode gradle npm pnpm yarn brew pip cocoapods app-caches claude"
+
+# Options
+CMD="scan"
+SELECTED=""
+SKIP=""
+ASSUME_YES=false
+DRY=false
+FORCE=false
+DAYS=30
+ROOTS=""
+KEEP_GRADLE=2
+FAILED=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B="" D="" R="" G="" Y="" C="" N=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s==>%s %s\n' "$C" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+has()  { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<EOF
+${B}storage-rm${N} $VERSION — clear regenerable dev/app junk on macOS
+
+${B}Usage${N}
+  storage-rm [scan]            Show how much each category would free (default, deletes nothing)
+  storage-rm clean             Clear the default categories (asks first)
+  storage-rm big [N]           List the N largest folders in your home (default 25)
+  storage-rm list              Describe every category
+
+${B}Options${N}
+  -o, --only a,b       Only these categories (can include opt-in ones)
+  -s, --skip a,b       Skip these categories
+  -a, --all            Include opt-in categories (android-avd, node-modules, trash)
+  -y, --yes            Don't ask for confirmation
+  -n, --dry-run        Show what clean would remove without removing it
+  -f, --force          Also clear caches of apps that are currently running
+      --days N         node-modules: only projects untouched for N days (default $DAYS)
+      --roots a:b      node-modules: folders to search (default ~/Documents:~/Developer:~/code:~/Projects:~/dev:~/src)
+      --keep-gradle N  gradle: keep the N newest wrapper distributions (default $KEEP_GRADLE)
+  -h, --help           Show this help
+  -v, --version        Show version
+
+${B}Examples${N}
+  storage-rm                          # scan
+  storage-rm clean -y                 # clear all default categories
+  storage-rm clean -o docker,xcode    # just those two
+  storage-rm clean -o node-modules --days 60 -n
+EOF
+}
+
+describe() {
+  case $1 in
+    docker)       echo "Docker build cache + dangling images (containers and volumes kept)" ;;
+    xcode)        echo "Xcode DerivedData, older iOS DeviceSupport, simulator caches, unavailable simulators" ;;
+    gradle)       echo "Gradle caches, daemon logs, old wrapper distributions" ;;
+    npm)          echo "npm cache and npx cache" ;;
+    pnpm)         echo "pnpm content store" ;;
+    yarn)         echo "Yarn cache" ;;
+    brew)         echo "Homebrew download cache and old versions" ;;
+    pip)          echo "pip cache" ;;
+    cocoapods)    echo "CocoaPods cache" ;;
+    app-caches)   echo "App caches: Spotify, browsers, Electron, Playwright, Steam, Epic, …" ;;
+    claude)       echo "Claude desktop simulator builds" ;;
+    android-avd)  echo "Android emulators (AVDs) and system images  [opt-in]" ;;
+    node-modules) echo "node_modules in projects untouched for --days  [opt-in]" ;;
+    trash)        echo "Empty the Trash  [opt-in]" ;;
+  esac
+}
+
+is_default() { case " $DEFAULT_CATS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# ---------- sizes ----------
+
+# KB -> human
+human() { awk -v k="${1:-0}" 'BEGIN{
+  split("K M G T",u," "); i=1; while (k>=1024 && i<4) { k/=1024; i++ }
+  if (i==1) printf "%dK", k; else printf "%.1f%s", k, u[i] }'; }
+
+# Sum du -sk over newline-separated paths on stdin
+kb_of_paths() {
+  local total=0 p s
+  while IFS= read -r p; do
+    [[ -n $p && -e $p ]] || continue
+    s=$(du -sk "$p" 2>/dev/null | cut -f1)
+    total=$((total + ${s:-0}))
+  done
+  echo "$total"
+}
+
+# "35.5GB" / "2.1 MB (5%)" -> KB, summed over lines on stdin
+docker_to_kb() {
+  awk '{
+    if (match($0, /[0-9.]+ ?[kKMGT]?B/)) {
+      s = substr($0, RSTART, RLENGTH); gsub(/ /, "", s)
+      n = s + 0; u = s; gsub(/[0-9.]/, "", u)
+      m = (u=="B") ? 1/1024 : (u=="kB"||u=="KB") ? 1 : (u=="MB") ? 1024 : (u=="GB") ? 1048576 : (u=="TB") ? 1073741824 : 0
+      t += n * m
+    }
+  } END { printf "%d\n", t }'
+}
+
+avail_kb() {
+  local vol=/System/Volumes/Data
+  [[ -d $vol ]] || vol=/
+  df -k "$vol" | awk 'NR==2{print $4}'
+}
+
+# ---------- removal ----------
+
+rm_path() {
+  local p=$1
+  [[ -n $p ]] || return 0
+  case $p in
+    "$HOME"/?*) ;;
+    *) warn "refusing to remove path outside home: $p"; FAILED=1; return 0 ;;
+  esac
+  [[ $p == "$HOME" || $p == "$LIB" || $p == "$CACHES" ]] && { warn "refusing to remove $p"; FAILED=1; return 0; }
+  [[ -e $p || -L $p ]] || return 0
+
+  if $DRY; then say "  ${D}would remove${N} $p"; return 0; fi
+
+  rm -rf "$p" 2>/dev/null
+  if [[ -e $p ]]; then
+    # Read-only or locked files (e.g. cached .app bundles)
+    chflags -R nouchg "$p" 2>/dev/null
+    chmod -R u+w "$p" 2>/dev/null
+    rm -rf "$p" 2>/dev/null
+  fi
+  if [[ -e $p ]]; then
+    warn "could not fully remove $p — macOS may be protecting it; delete it from Finder or give your terminal Full Disk Access / App Management"
+    FAILED=1
+  fi
+}
+
+rm_paths() { local p; while IFS= read -r p; do rm_path "$p"; done; }
+
+run() {
+  if $DRY; then say "  ${D}would run${N} $*"; return 0; fi
+  "$@" >/dev/null 2>&1 || warn "command failed: $*"
+}
+
+# ---------- categories ----------
+# Each category has paths_<name> (what du measures / what gets removed) and
+# optionally extra_<name> (commands to run) and size_<name> (custom sizing).
+
+docker_ready() { has docker && docker info >/dev/null 2>&1; }
+
+size_docker() {
+  docker_ready || { echo 0; return; }
+  {
+    docker system df --format '{{.Type}}|{{.Reclaimable}}' 2>/dev/null | awk -F'|' '$1=="Build Cache"{print $2}'
+    docker images -f dangling=true --format '{{.Size}}' 2>/dev/null
+  } | docker_to_kb
+}
+paths_docker() { :; }
+extra_docker() {
+  docker_ready || { warn "docker isn't running — skipping"; return; }
+  run docker builder prune -af
+  run docker image prune -f
+}
+
+# Keep the most recently used DeviceSupport folder per device model
+old_device_support() {
+  local dir="$LIB/Developer/Xcode/iOS DeviceSupport" seen="|" d model
+  [[ -d $dir ]] || return 0
+  while IFS= read -r d; do
+    [[ -n $d ]] || continue
+    model=${d%% *}
+    case $seen in
+      *"|$model|"*) echo "$dir/$d" ;;
+      *) seen="$seen$model|" ;;
+    esac
+  done < <(ls -t "$dir" 2>/dev/null)
+}
+paths_xcode() {
+  echo "$LIB/Developer/Xcode/DerivedData"
+  echo "$LIB/Developer/CoreSimulator/Caches"
+  echo "$CACHES/com.apple.dt.Xcode"
+  old_device_support
+}
+extra_xcode() { has xcrun && run xcrun simctl delete unavailable; }
+
+old_gradle_dists() {
+  local dir="$HOME/.gradle/wrapper/dists"
+  [[ -d $dir ]] || return 0
+  ls "$dir" | grep '^gradle-' | sed -E 's/^gradle-([^-]+)-.*/\1 &/' \
+    | sort -t. -k1,1nr -k2,2nr -k3,3nr | awk '{print $2}' \
+    | tail -n +$((KEEP_GRADLE + 1)) | sed "s|^|$dir/|"
+}
+paths_gradle() {
+  echo "$HOME/.gradle/caches"
+  echo "$HOME/.gradle/daemon"
+  old_gradle_dists
+}
+extra_gradle() { $DRY || pkill -f GradleDaemon 2>/dev/null; true; }
+
+paths_npm()       { echo "$HOME/.npm/_cacache"; echo "$HOME/.npm/_npx"; }
+paths_pnpm()      { echo "$LIB/pnpm/store"; echo "$CACHES/pnpm"; }
+paths_yarn()      { echo "$CACHES/Yarn"; echo "$HOME/.yarn/berry/cache"; }
+paths_pip()       { echo "$CACHES/pip"; echo "$CACHES/pypoetry"; }
+paths_cocoapods() { echo "$CACHES/CocoaPods"; }
+paths_claude()    { echo "$LIB/Application Support/Claude/simulator-builds"; }
+
+paths_brew() { has brew && brew --cache 2>/dev/null; }
+extra_brew() { has brew && run brew cleanup -s --prune=all; }
+
+# cache dir under ~/Library/Caches | process name that owns it (empty = no check)
+APP_CACHES="com.spotify.client|Spotify
+Firefox|firefox
+BraveSoftware|Brave Browser
+Google|Google Chrome
+com.microsoft.edgemac|Microsoft Edge
+ms-playwright|
+electron|
+electron-builder|
+dotslash|
+termius-updater|
+com.epicgames.EpicGamesLauncher|EpicGamesLauncher
+Steam|steam_osx
+node-gyp|
+typescript|
+go-build|
+com.microsoft.VSCode.ShipIt|
+com.todesktop.230313mzl4w4u92.ShipIt|"
+
+paths_app_caches() {
+  local dir proc
+  while IFS='|' read -r dir proc; do
+    [[ -e $CACHES/$dir ]] || continue
+    if [[ -n $proc ]] && ! $FORCE && pgrep -xq "$proc" 2>/dev/null; then
+      [[ $CMD == clean && -z ${SIZING:-} ]] && warn "$proc is running — skipping its cache (quit it or use --force)"
+      continue
+    fi
+    echo "$CACHES/$dir"
+  done <<<"$APP_CACHES"
+}
+
+paths_android_avd() {
+  local f
+  for f in "$HOME/.android/avd"/*.avd "$HOME/.android/avd"/*.ini; do [[ -e $f ]] && echo "$f"; done
+  echo "$LIB/Android/sdk/system-images"
+}
+
+search_roots() {
+  local r list=${ROOTS:-"$HOME/Documents:$HOME/Developer:$HOME/code:$HOME/Projects:$HOME/dev:$HOME/src"}
+  local IFS=:
+  for r in $list; do r=${r/#\~/$HOME}; [[ -d $r ]] && echo "$r"; done
+}
+
+# node_modules whose project has no file changed within --days
+paths_node_modules() {
+  local root nm proj recent
+  while IFS= read -r root; do
+    while IFS= read -r nm; do
+      proj=${nm%/node_modules}
+      recent=$(find "$proj" -maxdepth 3 \( -name node_modules -o -name .git \) -prune -o -type f -mtime "-$DAYS" -print 2>/dev/null | head -1)
+      [[ -z $recent ]] && echo "$nm"
+    done < <(find "$root" -maxdepth 6 -type d -name node_modules -prune 2>/dev/null)
+  done < <(search_roots)
+}
+
+paths_trash() {
+  if ! ls "$HOME/.Trash" >/dev/null 2>&1; then
+    [[ $CMD == clean && -z ${SIZING:-} ]] && warn "can't read ~/.Trash — give your terminal Full Disk Access, or empty it from Finder"
+    return
+  fi
+  find "$HOME/.Trash" -mindepth 1 -maxdepth 1 2>/dev/null
+}
+
+fn_of() { echo "${1//-/_}"; }
+
+cat_paths() { "paths_$(fn_of "$1")"; }
+
+cat_size() {
+  local f SIZING=1; f=$(fn_of "$1")
+  if declare -F "size_$f" >/dev/null; then "size_$f"; else "paths_$f" | kb_of_paths; fi
+}
+
+clean_cat() {
+  local f; f=$(fn_of "$1")
+  declare -F "extra_$f" >/dev/null && "extra_$f"
+  "paths_$f" | rm_paths
+}
+
+# ---------- selection ----------
+
+valid_cat() { case " $ALL_CATS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+selected_cats() {
+  local base=$DEFAULT_CATS c out=""
+  [[ $CMD == scan ]] && base=$ALL_CATS
+  [[ -n $SELECTED ]] && base=${SELECTED//,/ }
+  for c in $base; do
+    case ",$SKIP," in *",$c,"*) continue ;; esac
+    out="$out $c"
+  done
+  echo "$out"
+}
+
+# ---------- commands ----------
+
+cmd_list() {
+  local c
+  for c in $ALL_CATS; do
+    printf '  %s%-13s%s %s\n' "$B" "$c" "$N" "$(describe "$c")"
+  done
+}
+
+print_row() { printf '  %-13s %8s  %s%s%s\n' "$1" "$2" "$D" "$3" "$N"; }
+
+cmd_scan() {
+  local c kb total=0 opt=0
+  info "Scanning (nothing is deleted)…"
+  printf '\n  %s%-13s %8s  %s%s\n' "$B" "CATEGORY" "SIZE" "WHAT" "$N"
+  for c in $(selected_cats); do
+    kb=$(cat_size "$c")
+    if is_default "$c"; then total=$((total + kb)); else opt=$((opt + kb)); fi
+    print_row "$c" "$(human "$kb")" "$(describe "$c")"
+  done
+  say ""
+  say "  ${B}clean${N} would free about ${G}$(human "$total")${N}"
+  (( opt > 0 )) && say "  opt-in categories hold another ${Y}$(human "$opt")${N} (use --all or --only)"
+  say ""
+  say "  Run ${B}storage-rm clean${N} to clear, or ${B}storage-rm clean -n${N} to preview paths."
+}
+
+cmd_clean() {
+  local cats c kb total=0 before after
+  cats=$(selected_cats)
+  [[ -n ${cats// /} ]] || die "nothing selected"
+
+  info "Planned cleanup:"
+  for c in $cats; do
+    kb=$(cat_size "$c"); total=$((total + kb))
+    print_row "$c" "$(human "$kb")" "$(describe "$c")"
+  done
+  say "  ${B}total ≈ $(human "$total")${N}"
+  say ""
+
+  if ! $DRY && ! $ASSUME_YES; then
+    [[ -t 0 ]] || die "not a terminal — pass -y to confirm"
+    printf 'Proceed? [y/N] '
+    read -r ans
+    case $ans in y|Y|yes|YES) ;; *) say "Aborted."; exit 0 ;; esac
+  fi
+
+  before=$(avail_kb)
+  for c in $cats; do
+    info "$c"
+    clean_cat "$c"
+  done
+  after=$(avail_kb)
+
+  say ""
+  if $DRY; then
+    say "Dry run — nothing was removed."
+  else
+    say "${G}Freed $(human $((after > before ? after - before : 0)))${N} — $(human "$after") available now."
+    (( FAILED )) && warn "some items couldn't be removed (see above)"
+  fi
+}
+
+cmd_big() {
+  local n=${1:-25}
+  info "Largest folders in your home (this can take a minute)…"
+  {
+    du -sk "$HOME"/* "$HOME"/.[!.]* 2>/dev/null
+    du -sk "$LIB"/* "$LIB/Application Support"/* "$CACHES"/* "$LIB/Developer"/* 2>/dev/null
+  } | grep -v -e "	$LIB\$" -e "	$LIB/Application Support\$" -e "	$CACHES\$" -e "	$LIB/Developer\$" \
+    | sort -rn | head -n "$n" \
+    | while IFS=$'\t' read -r kb p; do printf '  %8s  %s\n' "$(human "$kb")" "${p/#$HOME/~}"; done
+}
+
+# ---------- args ----------
+
+ARGS=()
+while (( $# )); do
+  case $1 in
+    scan|clean|list|big) CMD=$1 ;;
+    -o|--only)   [[ $# -ge 2 ]] || die "$1 needs a value"; SELECTED=$2; shift ;;
+    --only=*)    SELECTED=${1#*=} ;;
+    -s|--skip)   [[ $# -ge 2 ]] || die "$1 needs a value"; SKIP=$2; shift ;;
+    --skip=*)    SKIP=${1#*=} ;;
+    -a|--all)    SELECTED=${ALL_CATS// /,} ;;
+    -y|--yes)    ASSUME_YES=true ;;
+    -n|--dry-run) DRY=true ;;
+    -f|--force)  FORCE=true ;;
+    --days)      [[ ${2:-} =~ ^[0-9]+$ ]] || die "--days needs a number"; DAYS=$2; shift ;;
+    --roots)     [[ $# -ge 2 ]] || die "--roots needs a value"; ROOTS=$2; shift ;;
+    --keep-gradle) [[ ${2:-} =~ ^[0-9]+$ ]] || die "--keep-gradle needs a number"; KEEP_GRADLE=$2; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    -v|--version) echo "storage-rm $VERSION"; exit 0 ;;
+    -*)          die "unknown option $1 (see --help)" ;;
+    *)           ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+for c in ${SELECTED//,/ } ${SKIP//,/ }; do
+  valid_cat "$c" || die "unknown category '$c' (see: storage-rm list)"
+done
+
+[[ $(uname) == Darwin ]] || warn "storage-rm is built for macOS; some categories won't apply here"
+
+case $CMD in
+  scan)  cmd_scan ;;
+  clean) cmd_clean ;;
+  list)  cmd_list ;;
+  big)   cmd_big "${ARGS[0]:-25}" ;;
+esac
